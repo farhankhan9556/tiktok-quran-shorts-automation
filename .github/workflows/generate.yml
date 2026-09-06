@@ -1,9 +1,11 @@
 name: Generate TikTok Quran Video
 
 on:
+
   workflow_dispatch:
 
   schedule:
+
     - cron: "0 13 * * *"
       timezone: "Asia/Dubai"
 
@@ -20,26 +22,29 @@ jobs:
 
     steps:
 
+
       - name: Checkout repository
+
         uses: actions/checkout@v5
 
 
       - name: Set up Python
+
         uses: actions/setup-python@v6
 
         with:
+
           python-version: "3.13"
 
 
-      - name: Install FFmpeg and Arabic rendering libraries
+      - name: Install FFmpeg and Arabic libraries
 
         run: |
 
           sudo apt-get update
 
-          sudo apt-get install -y ffmpeg
-
           sudo apt-get install -y \
+            ffmpeg \
             libfreetype6-dev \
             libharfbuzz-dev \
             libfribidi-dev \
@@ -58,13 +63,14 @@ jobs:
       - name: Check Pexels API key
 
         env:
+
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
 
         run: |
 
           if [ -z "$PEXELS_API_KEY" ]; then
 
-            echo "PEXELS_API_KEY is missing"
+            echo "ERROR: PEXELS_API_KEY is missing"
 
             exit 1
 
@@ -79,7 +85,7 @@ jobs:
 
           if [ ! -f "fonts/NotoNaskhArabic-Regular.otf" ]; then
 
-            echo "Arabic font is missing"
+            echo "ERROR: Arabic font is missing"
 
             exit 1
 
@@ -95,9 +101,10 @@ jobs:
           mkdir -p output
 
 
-      - name: Generate today's TikTok video
+      - name: Generate TikTok video
 
         env:
+
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
 
         run: |
@@ -105,15 +112,19 @@ jobs:
           python generate_tiktok.py
 
 
-      - name: Check generated files
+      - name: Check generated video
 
         run: |
+
+          echo "Generated files:"
 
           ls -lh output
 
           test -f output/tiktok_quran_1.mp4
 
           test -f output/metadata_1.txt
+
+          echo "Video generation successful"
 
 
       - name: Upload generated video
