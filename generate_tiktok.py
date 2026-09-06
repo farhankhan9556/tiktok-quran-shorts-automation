@@ -50,7 +50,7 @@ SHORT_SURAHS = {
     114: "An-Nas",
 }
 
-SURAH_CATEGORY = "Category:Recitations_of_the_Qur%27an_by_Aaqib_Azeez"
+SURAH_CATEGORY = "Category:Recitations of the Qur'an by Aaqib Azeez"
 
 
 def get_json(url, params=None, timeout=60):
