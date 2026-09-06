@@ -1,46 +1,46 @@
-
-import base64
 import os
-import random
 import re
+import json
+import random
+import shutil
 import subprocess
 from pathlib import Path
+from urllib.parse import quote
 
 import requests
 from PIL import Image, ImageDraw, ImageFont
-from openai import OpenAI
+
+# ============================================================
+# TikTok Quran Shorts - FREE Pexels + CC0 Wikimedia workflow
+# ============================================================
+
+W = 1080
+H = 1920
+FPS = 30
 
 ROOT = Path(__file__).resolve().parent
-OUT = ROOT / "output"
-WORK = ROOT / "work"
+OUTPUT = ROOT / "output"
 FONT = ROOT / "fonts" / "NotoNaskhArabic-Regular.otf"
 
-OUT.mkdir(exist_ok=True)
-WORK.mkdir(exist_ok=True)
-
-W, H = 1080, 1920
-FPS = 30
-VIDEO_COUNT = 2
-
-OPENAI_MODEL = "gpt-image-2"
+PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "").strip()
 
 WIKIMEDIA_API = "https://commons.wikimedia.org/w/api.php"
 WIKIMEDIA_HEADERS = {
     "User-Agent": (
-        "TikTokQuranShortsBot/1.0 "
+        "TikTokQuranShortsAutomation/1.0 "
         "(https://github.com/farhankhan9556/tiktok-quran-shorts-automation) "
         "requests"
     ),
     "Accept": "application/json",
 }
 
-# Short surahs with compact CC0 recitations in the Aaqib Azeez Commons category.
+# Short surahs are used so each generated video can contain one complete surah.
 SHORT_SURAHS = {
     103: "Al-Asr",
     104: "Al-Humazah",
     105: "Al-Fil",
     106: "Quraysh",
-    107: "Al-Maun",
+    107: "Al-Ma'un",
     108: "Al-Kawthar",
     109: "Al-Kafirun",
     110: "An-Nasr",
@@ -50,25 +50,55 @@ SHORT_SURAHS = {
     114: "An-Nas",
 }
 
-SURAH_CATEGORY = "Category:Recitations of the Qur'an by Aaqib Azeez"
+# Pexels search terms. Each run chooses two different visual themes.
+NATURE_QUERIES = [
+    "cinematic ocean waves sunset",
+    "misty mountain sunrise",
+    "waterfall forest cinematic",
+    "rain forest leaves",
+    "desert sunset dunes",
+    "clouds mountains cinematic",
+    "green forest sunlight",
+    "lake mountains sunrise",
+    "night sky stars nature",
+    "ocean beach slow motion",
+]
+
+# ============================================================
+# Helpers
+# ============================================================
+
+def run(cmd):
+    print("$", " ".join(map(str, cmd)))
+    subprocess.run(cmd, check=True)
 
 
-def get_json(url, params=None, timeout=60):
-    r = requests.get(url, params=params, headers=WIKIMEDIA_HEADERS, timeout=timeout)
-    r.raise_for_status()
-    return r.json()
-
-
-def download(url, path, timeout=120):
-    r = requests.get(url, headers=WIKIMEDIA_HEADERS, timeout=timeout)
+def download(url, path, headers=None):
+    r = requests.get(url, headers=headers or {}, timeout=60)
     r.raise_for_status()
     path.write_bytes(r.content)
-    return path
 
 
-def ffmpeg(*args, check=True):
-    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *map(str, args)]
-    return subprocess.run(cmd, check=check)
+def clean_text(s):
+    return re.sub(r"\s+", " ", s or "").strip()
+
+
+def split_arabic_words(text):
+    # Keep Arabic words while removing common punctuation.
+    text = re.sub(r"[ۖۗۚۛۙۜۢ۝﴾﴿]", " ", text)
+    text = text.replace("(", " ").replace(")", " ")
+    return [x for x in clean_text(text).split() if x]
+
+
+def group_words(words, group_size=4):
+    return [words[i:i + group_size] for i in range(0, len(words), group_size)]
+
+
+def ensure_dirs():
+    OUTPUT.mkdir(exist_ok=True)
+    for p in OUTPUT.iterdir():
+        if p.is_file():
+            p.unlink()
 
 
 def ffprobe_duration(path):
@@ -86,407 +116,525 @@ def ffprobe_duration(path):
     return float(result.stdout.strip())
 
 
-def get_surah(surah_number):
+# ============================================================
+# Quran text
+# ============================================================
+
+def get_surah_text(surah_number):
     url = f"https://api.alquran.cloud/v1/surah/{surah_number}/quran-uthmani"
-    r = requests.get(url, timeout=60)
+    r = requests.get(url, timeout=30)
     r.raise_for_status()
-    data = r.json()["data"]
-    return data["name"], data["englishName"], data["ayahs"]
+    data = r.json()
+
+    if data.get("status") != "OK":
+        raise RuntimeError(f"Quran API failed for surah {surah_number}")
+
+    ayahs = data["data"]["ayahs"]
+    return [
+        {
+            "number": a["numberInSurah"],
+            "text": clean_text(a["text"]),
+        }
+        for a in ayahs
+    ]
 
 
-def discover_cc0_recitations():
-    found = {}
+# ============================================================
+# Wikimedia Commons CC0 recitations
+# ============================================================
 
+def commons_category_files():
+    """Return all file titles in the Aaqib Azeez recitation category."""
+    files = []
+    cmcontinue = None
+
+    while True:
+        params = {
+            "action": "query",
+            "format": "json",
+            "list": "categorymembers",
+            "cmtitle": "Category:Recitations of the Qur'an by Aaqib Azeez",
+            "cmnamespace": "6",
+            "cmtype": "file",
+            "cmlimit": "max",
+        }
+        if cmcontinue:
+            params["cmcontinue"] = cmcontinue
+
+        r = requests.get(
+            WIKIMEDIA_API,
+            params=params,
+            headers=WIKIMEDIA_HEADERS,
+            timeout=30,
+        )
+        r.raise_for_status()
+        data = r.json()
+
+        files.extend(x["title"] for x in data["query"]["categorymembers"])
+
+        if "continue" not in data:
+            break
+        cmcontinue = data["continue"]["cmcontinue"]
+
+    return files
+
+
+def commons_file_info(title):
     params = {
         "action": "query",
         "format": "json",
-        "list": "categorymembers",
-        "cmtitle": SURAH_CATEGORY,
-        "cmnamespace": 6,
-        "cmlimit": "max",
+        "titles": title,
+        "prop": "imageinfo",
+        "iiprop": "url|extmetadata",
     }
 
-    data = get_json(WIKIMEDIA_API, params=params)
-    pages = data.get("query", {}).get("categorymembers", [])
-
-    for page in pages:
-        title = page.get("title", "")
-        if "Murattal" not in title:
-            continue
-
-        match = re.search(r"Chapter\s+(\d+)", title, re.I)
-        if not match:
-            continue
-
-        number = int(match.group(1))
-        if number not in SHORT_SURAHS:
-            continue
-
-        info = get_json(
-            WIKIMEDIA_API,
-            params={
-                "action": "query",
-                "format": "json",
-                "prop": "imageinfo",
-                "titles": title,
-                "iiprop": "url|extmetadata",
-            },
-        )
-
-        pages2 = info.get("query", {}).get("pages", {})
-        page2 = next(iter(pages2.values()), {})
-        imageinfo = page2.get("imageinfo", [])
-        if not imageinfo:
-            continue
-
-        ii = imageinfo[0]
-        meta = ii.get("extmetadata", {})
-        license_name = (
-            meta.get("LicenseShortName", {}).get("value", "")
-            or meta.get("License", {}).get("value", "")
-        )
-
-        if not re.search(r"\bCC0\b|Public\s*domain", license_name, re.I):
-            continue
-
-        url = ii.get("url")
-        if url:
-            found[number] = {
-                "title": title,
-                "url": url,
-                "license": license_name,
-            }
-
-    return found
-
-
-def generate_background(client, english_name, number, path):
-    prompts = [
-        (
-            f"Create a cinematic vertical 9:16 nature scene inspired by the peaceful "
-            f"spiritual atmosphere of Quran Surah {english_name} (chapter {number}). "
-            "No people, no faces, no animals close-up, no text, no Arabic calligraphy, "
-            "no religious symbols. Moody dawn light, deep natural shadows, realistic "
-            "photography, mist, subtle volumetric light, premium film look, calm and "
-            "respectful, highly detailed, suitable as a background for a Quran TikTok."
-        ),
-        (
-            f"Create a serene cinematic wilderness landscape for a Quran recitation "
-            f"video, inspired by Surah {english_name} chapter {number}. "
-            "Vertical 9:16 composition, dramatic clouds, mountains and soft atmospheric "
-            "light, realistic photography, dark elegant mood, no people, no text, no "
-            "logos, no buildings, no religious symbols, premium cinematic color and "
-            "depth, large clean central/lower area for Arabic subtitles."
-        ),
-    ]
-
-    prompt = random.choice(prompts)
-    result = client.images.generate(
-        model=OPENAI_MODEL,
-        prompt=prompt,
-        size="1024x1792",
-        output_format="png",
+    r = requests.get(
+        WIKIMEDIA_API,
+        params=params,
+        headers=WIKIMEDIA_HEADERS,
+        timeout=30,
     )
-    b64 = result.data[0].b64_json
-    path.write_bytes(base64.b64decode(b64))
+    r.raise_for_status()
 
-    # Ensure the generated image has the expected portrait shape.
-    img = Image.open(path).convert("RGB")
-    img = img.resize((W, H), Image.Resampling.LANCZOS)
-    img.save(path, "PNG")
+    pages = r.json()["query"]["pages"]
+    page = next(iter(pages.values()))
 
-
-def split_words(text, group_size=4):
-    words = text.split()
-    return [" ".join(words[i:i + group_size]) for i in range(0, len(words), group_size)]
-
-
-def make_overlay(text, reference, path, font_size=76):
-    canvas = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(canvas)
-
-    font = ImageFont.truetype(str(FONT), font_size)
-
-    # Fit long groups into the safe width.
-    while True:
-        bbox = draw.textbbox(
-            (0, 0),
-            text,
-            font=font,
-            direction="rtl",
-            language="ar",
-            stroke_width=0,
-        )
-        if bbox[2] - bbox[0] <= 920 or font_size <= 46:
-            break
-        font_size -= 4
-        font = ImageFont.truetype(str(FONT), font_size)
-
-    center_x = W // 2
-    arabic_y = 1180
-
-    # Soft shadow/glow.
-    draw.text(
-        (center_x + 3, arabic_y + 5),
-        text,
-        font=font,
-        anchor="mm",
-        direction="rtl",
-        language="ar",
-        fill=(0, 0, 0, 180),
-        stroke_width=3,
-        stroke_fill=(0, 0, 0, 120),
-    )
-    draw.text(
-        (center_x, arabic_y),
-        text,
-        font=font,
-        anchor="mm",
-        direction="rtl",
-        language="ar",
-        fill=(255, 255, 255, 255),
-    )
-
-    small_font = ImageFont.truetype(str(FONT), 34)
-    draw.text(
-        (center_x, arabic_y + 100),
-        reference,
-        font=small_font,
-        anchor="mm",
-        direction="rtl",
-        language="ar",
-        fill=(240, 240, 240, 225),
-    )
-
-    canvas.save(path, "PNG")
-
-
-def make_audio_mix(recitation, ambience, out_audio):
-    duration = ffprobe_duration(recitation)
-
-    if ambience and ambience.exists():
-        # Very quiet nature ambience underneath the recitation.
-        ffmpeg(
-            "-stream_loop", "-1",
-            "-i", ambience,
-            "-i", recitation,
-            "-filter_complex",
-            "[0:a]volume=0.045,atrim=0:{d}[nat];"
-            "[1:a]volume=1.0[rec];"
-            "[nat][rec]amix=inputs=2:duration=shortest:dropout_transition=2[a]"
-            .format(d=duration),
-            "-map", "[a]",
-            "-c:a", "aac",
-            "-b:a", "192k",
-            "-t", duration,
-            out_audio,
-        )
-    else:
-        ffmpeg(
-            "-i", recitation,
-            "-c:a", "aac",
-            "-b:a", "192k",
-            "-t", duration,
-            out_audio,
-        )
-
-    return duration
-
-
-def create_video(background, recitation, ayahs, surah_name, surah_number, video_path, ambience):
-    audio_path = WORK / f"audio_{surah_number}.m4a"
-    duration = make_audio_mix(recitation, ambience, audio_path)
-
-    # Estimate each ayah duration from its Arabic character count.
-    weights = [max(1, len(a["text"])) for a in ayahs]
-    total_weight = sum(weights)
-
-    current = 0.0
-    segments = []
-
-    for ayah in ayahs:
-        ayah_duration = duration * max(1, len(ayah["text"])) / total_weight
-        groups = split_words(ayah["text"], 4)
-        group_weights = [max(1, len(g.replace(" ", ""))) for g in groups]
-        group_total = sum(group_weights)
-
-        group_start = current
-        for index, group in enumerate(groups):
-            group_duration = ayah_duration * group_weights[index] / group_total
-            overlay = WORK / (
-                f"overlay_{surah_number}_{ayah['numberInSurah']}_{index}.png"
-            )
-            make_overlay(
-                group,
-                f"Surah {surah_number}:{ayah['numberInSurah']}",
-                overlay,
-            )
-            segments.append((group_start, group_duration, overlay))
-            group_start += group_duration
-
-        current += ayah_duration
-
-    # Base video: slow cinematic zoom on the AI image.
-    base = WORK / f"base_{surah_number}.mp4"
-    vf = (
-        "scale=1080:1920:force_original_aspect_ratio=increase,"
-        "crop=1080:1920,"
-        "zoompan=z='min(zoom+0.00035,1.08)':"
-        "x='iw/2-(iw/zoom/2)':"
-        "y='ih/2-(ih/zoom/2)':"
-        f"d=1:s=1080x1920:fps={FPS},"
-        "format=yuv420p"
-    )
-
-    ffmpeg(
-        "-loop", "1",
-        "-i", background,
-        "-vf", vf,
-        "-t", duration,
-        "-an",
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "20",
-        "-pix_fmt", "yuv420p",
-        base,
-    )
-
-    # Build overlay filter graph.
-    inputs = ["-i", str(base), "-i", str(audio_path)]
-    filters = []
-    last = "[0:v]"
-
-    for i, (start, seg_duration, overlay) in enumerate(segments):
-        inputs += ["-i", str(overlay)]
-        out = f"[v{i}]"
-        filters.append(
-            f"{last}[{i+2}:v]overlay=0:0:enable='between(t,{start:.3f},{start+seg_duration:.3f})'{out}"
-        )
-        last = out
-
-    filter_complex = ";".join(filters)
-
-    ffmpeg(
-        *inputs,
-        "-filter_complex", filter_complex,
-        "-map", last,
-        "-map", "1:a",
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "20",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac",
-        "-b:a", "192k",
-        "-movflags", "+faststart",
-        "-shortest",
-        video_path,
-    )
-
-
-def get_ambience():
-    # Known CC0 Commons file. If unavailable, video generation continues without it.
-    title = "File:Ocean Waves on a Tropical Beach.ogg"
-    try:
-        data = get_json(
-            WIKIMEDIA_API,
-            params={
-                "action": "query",
-                "format": "json",
-                "prop": "imageinfo",
-                "titles": title,
-                "iiprop": "url|extmetadata",
-            },
-        )
-        pages = data.get("query", {}).get("pages", {})
-        page = next(iter(pages.values()), {})
-        info = page.get("imageinfo", [])
-        if not info:
-            return None
-
-        ii = info[0]
-        license_name = (
-            ii.get("extmetadata", {})
-            .get("LicenseShortName", {})
-            .get("value", "")
-        )
-        if not re.search(r"\bCC0\b|Public\s*domain", license_name, re.I):
-            return None
-
-        path = WORK / "nature_ambience.ogg"
-        return download(ii["url"], path)
-    except Exception as exc:
-        print(f"Nature ambience unavailable; continuing without it: {exc}")
+    if "imageinfo" not in page:
         return None
 
+    info = page["imageinfo"][0]
+    meta = info.get("extmetadata", {})
 
-def write_metadata(index, surah_number, surah_name):
-    path = OUT / f"metadata_{index}.txt"
-    title = f"Surah {surah_number} | {surah_name} | Quran Recitation"
-    caption = (
-        f"Surah {surah_number} — {surah_name} 🌿📖\n"
-        "Listen, reflect, and remember.\n\n"
-        f"#Quran #QuranRecitation #Surah{surah_number} "
-        "#Islam #IslamicReminder #MuslimTikTok #QuranVerse"
-    )
-    path.write_text(
-        f"Title: {title}\n\nCaption:\n{caption}\n\n"
-        "Visual: AI-generated cinematic nature background.\n"
-        "Recitation: verified CC0/public-domain Wikimedia Commons recording.\n"
-        "Arabic text: Tanzil/Quran text source via Al Quran Cloud.\n",
-        encoding="utf-8",
+    license_name = (
+        meta.get("LicenseShortName", {}).get("value", "")
+        or meta.get("License", {}).get("value", "")
     )
 
+    return {
+        "title": title,
+        "url": info["url"],
+        "license": clean_text(re.sub("<[^>]+>", "", license_name)),
+    }
+
+
+def surah_number_from_title(title):
+    m = re.search(r"Chapter\s+(\d+)", title, re.I)
+    return int(m.group(1)) if m else None
+
+
+def discover_cc0_recitations():
+    print("Discovering CC0/public-domain Qur'an recitations...")
+    titles = commons_category_files()
+
+    candidates = []
+    wanted = set(SHORT_SURAHS)
+
+    for title in titles:
+        if "(Murattal)" not in title:
+            continue
+
+        number = surah_number_from_title(title)
+        if number not in wanted:
+            continue
+
+        try:
+            info = commons_file_info(title)
+        except Exception as e:
+            print("Skipping Wikimedia file:", title, e)
+            continue
+
+        if not info:
+            continue
+
+        license_text = info["license"].lower()
+        if "cc0" not in license_text and "public domain" not in license_text:
+            continue
+
+        candidates.append(
+            {
+                "surah": number,
+                "name": SHORT_SURAHS[number],
+                "title": title,
+                "url": info["url"],
+                "license": info["license"],
+            }
+        )
+
+    # One recording per surah; avoid duplicate v2 recordings unless necessary.
+    unique = {}
+    for c in candidates:
+        if c["surah"] not in unique:
+            unique[c["surah"]] = c
+
+    result = list(unique.values())
+
+    print(f"Found {len(result)} usable CC0/public-domain short-surah recordings.")
+
+    if len(result) < 2:
+        raise RuntimeError(
+            "Fewer than 2 usable CC0/public-domain short-surah recordings were found."
+        )
+
+    return result
+
+
+# ============================================================
+# Pexels
+# ============================================================
+
+def pexels_search(query):
+    if not PEXELS_API_KEY:
+        raise RuntimeError("PEXELS_API_KEY GitHub secret is missing.")
+
+    r = requests.get(
+        "https://api.pexels.com/v1/videos/search",
+        headers={"Authorization": PEXELS_API_KEY},
+        params={
+            "query": query,
+            "orientation": "portrait",
+            "size": "medium",
+            "per_page": 15,
+        },
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json().get("videos", [])
+
+
+def choose_pexels_video(query):
+    videos = pexels_search(query)
+    if not videos:
+        raise RuntimeError(f"No Pexels portrait videos found for: {query}")
+
+    # Prefer videos with a reasonable portrait source and duration.
+    ranked = []
+    for video in videos:
+        duration = float(video.get("duration") or 0)
+        files = video.get("video_files") or []
+        portrait_files = []
+
+        for f in files:
+            w = f.get("width") or 0
+            h = f.get("height") or 0
+            if h >= w and h >= 1280 and f.get("link"):
+                portrait_files.append(f)
+
+        if not portrait_files:
+            continue
+
+        # Prefer ~1080p and clips at least 15 seconds.
+        portrait_files.sort(
+            key=lambda f: (
+                abs((f.get("width") or 0) - 1080),
+                -(f.get("height") or 0),
+            )
+        )
+        chosen = portrait_files[0]
+
+        score = (0 if duration >= 15 else 10, abs((chosen.get("width") or 0) - 1080))
+        ranked.append((score, video, chosen))
+
+    if not ranked:
+        raise RuntimeError(f"No suitable portrait Pexels video found for: {query}")
+
+    ranked.sort(key=lambda x: x[0])
+    _, video, chosen = ranked[0]
+
+    return {
+        "video_id": video.get("id"),
+        "page_url": video.get("url", "https://www.pexels.com/"),
+        "photographer": video.get("user", {}).get("name", "Pexels contributor"),
+        "download_url": chosen["link"],
+    }
+
+
+# ============================================================
+# Arabic overlay
+# ============================================================
+
+def render_overlay(text, surah_name, verse_number, path):
+    image = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+
+    font = ImageFont.truetype(str(FONT), 74)
+    ref_font = ImageFont.truetype(str(FONT), 34)
+
+    # Pillow uses libraqm on the GitHub runner because we install
+    # libraqm/harfbuzz/fribidi in the workflow.
+    bbox = draw.textbbox(
+        (0, 0),
+        text,
+        font=font,
+        direction="rtl",
+        language="ar",
+        stroke_width=0,
+    )
+
+    tw = bbox[2] - bbox[0]
+    x = W // 2 + tw // 2
+    y = int(H * 0.62)
+
+    # Subtle shadow/glow, no dark panel.
+    for dx, dy, alpha in [
+        (3, 3, 140),
+        (-2, 2, 90),
+        (2, -2, 70),
+    ]:
+        draw.text(
+            (x + dx, y + dy),
+            text,
+            font=font,
+            fill=(0, 0, 0, alpha),
+            anchor="mm",
+            direction="rtl",
+            language="ar",
+        )
+
+    draw.text(
+        (x, y),
+        text,
+        font=font,
+        fill=(255, 255, 255, 255),
+        anchor="mm",
+        direction="rtl",
+        language="ar",
+    )
+
+    ref = f"{surah_name} • {verse_number}"
+    rb = draw.textbbox((0, 0), ref, font=ref_font)
+    rw = rb[2] - rb[0]
+
+    draw.text(
+        ((W + rw) // 2, int(H * 0.70)),
+        ref,
+        font=ref_font,
+        fill=(235, 235, 235, 235),
+        anchor="mm",
+    )
+
+    image.save(path)
+
+
+def build_overlays(ayahs, total_duration, workdir):
+    overlays = []
+    all_groups = []
+
+    for ayah in ayahs:
+        words = split_arabic_words(ayah["text"])
+        groups = group_words(words, 4)
+        all_groups.append((ayah["number"], groups))
+
+    total_groups = sum(len(groups) for _, groups in all_groups)
+    if total_groups == 0:
+        raise RuntimeError("No Arabic words found.")
+
+    group_duration = total_duration / total_groups
+    t = 0.0
+
+    for verse_number, groups in all_groups:
+        for group in groups:
+            overlay = workdir / f"overlay_{len(overlays):03d}.png"
+            render_overlay(
+                " ".join(group),
+                current_surah_name,
+                verse_number,
+                overlay,
+            )
+            overlays.append(
+                {
+                    "path": overlay,
+                    "start": t,
+                    "duration": group_duration,
+                }
+            )
+            t += group_duration
+
+    return overlays
+
+
+# ============================================================
+# Video creation
+# ============================================================
+
+current_surah_name = ""
+
+
+def create_video(surah, recitation_path, nature_path, output_path):
+    global current_surah_name
+    current_surah_name = surah["name"]
+
+    duration = ffprobe_duration(recitation_path)
+
+    workdir = OUTPUT / f"work_{surah['number']}"
+    if workdir.exists():
+        shutil.rmtree(workdir)
+    workdir.mkdir(parents=True)
+
+    ayahs = get_surah_text(surah["number"])
+    overlays = build_overlays(ayahs, duration, workdir)
+
+    # Scale/crop the Pexels portrait video to exactly 1080x1920.
+    # Loop if it is shorter than the recitation.
+    base = workdir / "base.mp4"
+
+    run(
+        [
+            "ffmpeg", "-y",
+            "-stream_loop", "-1",
+            "-i", str(nature_path),
+            "-t", f"{duration:.3f}",
+            "-vf",
+            (
+                "scale=1080:1920:force_original_aspect_ratio=increase,"
+                "crop=1080:1920,"
+                "setsar=1"
+            ),
+            "-an",
+            "-r", str(FPS),
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            str(base),
+        ]
+    )
+
+    # Create overlay inputs and enable each one during its time range.
+    cmd = ["ffmpeg", "-y", "-i", str(base), "-i", str(recitation_path)]
+
+    for item in overlays:
+        cmd += ["-loop", "1", "-i", str(item["path"])]
+
+    filter_parts = []
+    last = "[0:v]"
+
+    for idx, item in enumerate(overlays):
+        input_label = f"[{idx + 2}:v]"
+        output_label = f"[ov{idx}]"
+        end = item["start"] + item["duration"]
+
+        filter_parts.append(
+            f"{last}{input_label}"
+            f"overlay=0:0:enable='between(t,{item['start']:.3f},{end:.3f})'"
+            f"{output_label}"
+        )
+        last = output_label
+
+    filter_complex = ";".join(filter_parts)
+
+    cmd += [
+        "-filter_complex", filter_complex,
+        "-map", last,
+        "-map", "1:a:0",
+        "-t", f"{duration:.3f}",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "23",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-movflags", "+faststart",
+        str(output_path),
+    ]
+
+    run(cmd)
+
+    shutil.rmtree(workdir, ignore_errors=True)
+
+
+# ============================================================
+# Metadata
+# ============================================================
+
+def write_metadata(index, surah, recitation, pexels_info):
+    text = f"""TikTok Quran Short {index}
+
+Title:
+{surah['name']} — Surah {surah['number']} | Quran Recitation
+
+Caption:
+Listen to the Qur'an — Surah {surah['name']}. 🤍
+#Quran #QuranRecitation #Islam #Muslim #Allah #QuranShorts #TikTokIslam
+
+Recitation:
+CC0/public-domain recording from Wikimedia Commons.
+File: {recitation['title']}
+License: {recitation['license']}
+Source: {recitation['url']}
+
+Nature video:
+Pexels video ID: {pexels_info['video_id']}
+Photographer: {pexels_info['photographer']}
+Pexels page: {pexels_info['page_url']}
+
+Visual note:
+Arabic Qur'an text is displayed in groups of approximately 4 words at a time.
+Timing is proportional to the complete recitation, not word-level timestamped.
+"""
+    (OUTPUT / f"metadata_{index}.txt").write_text(text, encoding="utf-8")
+
+
+# ============================================================
+# Main
+# ============================================================
 
 def main():
-    if not os.environ.get("OPENAI_API_KEY"):
-        raise RuntimeError("OPENAI_API_KEY GitHub Secret is missing.")
-
     if not FONT.exists():
-        raise RuntimeError(f"Arabic font missing: {FONT}")
+        raise RuntimeError(f"Missing font: {FONT}")
 
-    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    if not PEXELS_API_KEY:
+        raise RuntimeError("PEXELS_API_KEY is missing.")
 
-    print("Discovering CC0/public-domain Qur'an recitations...")
+    ensure_dirs()
+
     recordings = discover_cc0_recitations()
+    random.shuffle(recordings)
+    selected = recordings[:2]
 
-    available = [n for n in SHORT_SURAHS if n in recordings]
-    if len(available) < VIDEO_COUNT:
-        raise RuntimeError(
-            f"Only {len(available)} usable CC0 short-surah recordings found; "
-            f"need at least {VIDEO_COUNT}."
+    used_surahs = set()
+
+    for index, recitation in enumerate(selected, start=1):
+        if recitation["surah"] in used_surahs:
+            continue
+        used_surahs.add(recitation["surah"])
+
+        print(
+            f"\n=== Video {index}: Surah {recitation['number']} "
+            f"{recitation['name']} ==="
         )
 
-    # Shuffle so consecutive days are not always identical.
-    random.shuffle(available)
-    selected = available[:VIDEO_COUNT]
+        rec_path = OUTPUT / f"recitation_{index}.mp3"
+        nature_path = OUTPUT / f"nature_{index}.mp4"
+        out_path = OUTPUT / f"tiktok_quran_{index}.mp4"
 
-    ambience = get_ambience()
+        print("Downloading CC0 recitation...")
+        download(recitation["url"], rec_path)
 
-    for index, surah_number in enumerate(selected, start=1):
-        print(f"Creating video {index}: Surah {surah_number}...")
+        query = NATURE_QUERIES[(index - 1) % len(NATURE_QUERIES)]
+        print("Searching Pexels:", query)
+        pexels_info = choose_pexels_video(query)
 
-        name_ar, english_name, ayahs = get_surah(surah_number)
-        recitation = WORK / f"recitation_{surah_number}.mp3"
-        download(recordings[surah_number]["url"], recitation)
+        print("Downloading Pexels nature video...")
+        download(pexels_info["download_url"], nature_path)
 
-        background = WORK / f"background_{surah_number}.png"
-        generate_background(client, english_name, surah_number, background)
-
-        video = OUT / f"tiktok_quran_{index}.mp4"
+        print("Creating final video...")
         create_video(
-            background,
             recitation,
-            ayahs,
-            english_name,
-            surah_number,
-            video,
-            ambience,
+            rec_path,
+            nature_path,
+            out_path,
         )
 
-        write_metadata(index, surah_number, english_name)
-        print(f"Created: {video}")
+        write_metadata(index, recitation, recitation, pexels_info)
 
-    print("All TikTok videos created successfully.")
+        rec_path.unlink(missing_ok=True)
+        nature_path.unlink(missing_ok=True)
+
+        print("Created:", out_path)
+
+    print("\nDONE")
+    for p in sorted(OUTPUT.glob("tiktok_quran_*.mp4")):
+        print(p, f"{p.stat().st_size / 1024 / 1024:.1f} MB")
 
 
 if __name__ == "__main__":
