@@ -13,8 +13,8 @@ from PIL import Image, ImageDraw, ImageFont
 # SETTINGS
 # ============================================================
 
-W = 1080
-H = 1920
+WIDTH = 1080
+HEIGHT = 1920
 FPS = 30
 
 ROOT = Path(__file__).resolve().parent
@@ -36,7 +36,7 @@ WIKIMEDIA_HEADERS = {
 
 
 # ============================================================
-# SHORT SURAHS WITH CC0 RECITATIONS
+# SHORT SURAHS
 # ============================================================
 
 SHORT_SURAHS = {
@@ -56,7 +56,7 @@ SHORT_SURAHS = {
 
 
 # ============================================================
-# PEXELS NATURE SEARCHES
+# PEXELS SEARCHES
 # ============================================================
 
 NATURE_QUERIES = [
@@ -77,60 +77,54 @@ NATURE_QUERIES = [
 # BASIC FUNCTIONS
 # ============================================================
 
-def run(cmd):
-    print("$", " ".join(map(str, cmd)))
-    subprocess.run(cmd, check=True)
+def run_command(command):
+    print("$", " ".join(str(x) for x in command))
+
+    subprocess.run(
+        command,
+        check=True
+    )
 
 
-def download(url, path, headers=None):
+def download_file(url, path, headers=None):
+
+    # Wikimedia requires a proper User-Agent.
+    if (
+        headers is None
+        and "upload.wikimedia.org" in url
+    ):
+        headers = WIKIMEDIA_HEADERS
+
     response = requests.get(
         url,
         headers=headers or {},
-        timeout=60
+        timeout=120,
+        allow_redirects=True
     )
 
     response.raise_for_status()
 
-    path.write_bytes(response.content)
+    if len(response.content) < 1000:
+        raise RuntimeError(
+            "Downloaded file is unexpectedly small: "
+            f"{len(response.content)} bytes"
+        )
+
+    path.write_bytes(
+        response.content
+    )
 
 
 def clean_text(text):
-    return re.sub(r"\s+", " ", text or "").strip()
-
-
-def split_arabic_words(text):
-    text = re.sub(
-        r"[ۖۗۚۛۙۜۢ۝﴾﴿]",
+    return re.sub(
+        r"\s+",
         " ",
-        text
-    )
-
-    text = text.replace("(", " ")
-    text = text.replace(")", " ")
-
-    return [
-        word
-        for word in clean_text(text).split()
-        if word
-    ]
+        text or ""
+    ).strip()
 
 
-def group_words(words, group_size=4):
-    return [
-        words[i:i + group_size]
-        for i in range(0, len(words), group_size)
-    ]
+def get_duration(file_path):
 
-
-def ensure_dirs():
-    OUTPUT.mkdir(exist_ok=True)
-
-    for item in OUTPUT.iterdir():
-        if item.is_file():
-            item.unlink()
-
-
-def ffprobe_duration(path):
     result = subprocess.run(
         [
             "ffprobe",
@@ -140,14 +134,32 @@ def ffprobe_duration(path):
             "format=duration",
             "-of",
             "default=noprint_wrappers=1:nokey=1",
-            str(path),
+            str(file_path),
         ],
         capture_output=True,
         text=True,
         check=True,
     )
 
-    return float(result.stdout.strip())
+    return float(
+        result.stdout.strip()
+    )
+
+
+def prepare_output():
+
+    OUTPUT.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    for item in OUTPUT.iterdir():
+
+        if item.is_file():
+            item.unlink()
+
+        elif item.is_dir():
+            shutil.rmtree(item)
 
 
 # ============================================================
@@ -172,28 +184,29 @@ def get_surah_text(surah_number):
 
     if data.get("status") != "OK":
         raise RuntimeError(
-            f"Quran API failed for surah {surah_number}"
+            f"Quran API failed for Surah {surah_number}"
         )
-
-    ayahs = data["data"]["ayahs"]
 
     return [
         {
             "number": ayah["numberInSurah"],
-            "text": clean_text(ayah["text"]),
+            "text": clean_text(
+                ayah["text"]
+            )
         }
-        for ayah in ayahs
+        for ayah in data["data"]["ayahs"]
     ]
 
 
 # ============================================================
-# WIKIMEDIA CC0 RECITATIONS
+# WIKIMEDIA
 # ============================================================
 
-def commons_category_files():
+def get_wikimedia_files():
 
     files = []
-    cmcontinue = None
+
+    continuation = None
 
     while True:
 
@@ -208,34 +221,36 @@ def commons_category_files():
             "cmlimit": "max",
         }
 
-        if cmcontinue:
-            params["cmcontinue"] = cmcontinue
+        if continuation:
+            params["cmcontinue"] = continuation
 
         response = requests.get(
             WIKIMEDIA_API,
             params=params,
             headers=WIKIMEDIA_HEADERS,
-            timeout=30,
+            timeout=30
         )
 
         response.raise_for_status()
 
         data = response.json()
 
-        files.extend(
-            item["title"]
-            for item in data["query"]["categorymembers"]
-        )
+        for item in data["query"]["categorymembers"]:
+            files.append(
+                item["title"]
+            )
 
         if "continue" not in data:
             break
 
-        cmcontinue = data["continue"]["cmcontinue"]
+        continuation = (
+            data["continue"]["cmcontinue"]
+        )
 
     return files
 
 
-def commons_file_info(title):
+def get_wikimedia_file_info(title):
 
     params = {
         "action": "query",
@@ -249,14 +264,18 @@ def commons_file_info(title):
         WIKIMEDIA_API,
         params=params,
         headers=WIKIMEDIA_HEADERS,
-        timeout=30,
+        timeout=30
     )
 
     response.raise_for_status()
 
-    pages = response.json()["query"]["pages"]
+    pages = response.json()[
+        "query"
+    ]["pages"]
 
-    page = next(iter(pages.values()))
+    page = next(
+        iter(pages.values())
+    )
 
     if "imageinfo" not in page:
         return None
@@ -273,114 +292,128 @@ def commons_file_info(title):
             "LicenseShortName",
             {}
         ).get("value", "")
-        or
-        metadata.get(
-            "License",
-            {}
-        ).get("value", "")
     )
 
+    if not license_name:
+
+        license_name = (
+            metadata.get(
+                "License",
+                {}
+            ).get("value", "")
+        )
+
     license_name = re.sub(
-        "<[^>]+>",
+        r"<[^>]+>",
         "",
         license_name
     )
 
     return {
-        "title": title,
         "url": info["url"],
-        "license": clean_text(license_name),
+        "license": clean_text(
+            license_name
+        )
     }
 
 
-def surah_number_from_title(title):
+def get_surah_number(title):
 
     match = re.search(
         r"Chapter\s+(\d+)",
         title,
-        re.I
+        re.IGNORECASE
     )
 
     if match:
-        return int(match.group(1))
+        return int(
+            match.group(1)
+        )
 
     return None
 
 
-def discover_cc0_recitations():
+def find_cc0_recitations():
 
     print(
-        "Discovering CC0/public-domain Qur'an recitations..."
+        "Finding CC0/public-domain "
+        "Quran recitations..."
     )
 
-    titles = commons_category_files()
+    titles = get_wikimedia_files()
 
-    candidates = []
-
-    wanted = set(SHORT_SURAHS)
+    found = {}
 
     for title in titles:
 
         if "(Murattal)" not in title:
             continue
 
-        number = surah_number_from_title(title)
+        surah_number = get_surah_number(
+            title
+        )
 
-        if number not in wanted:
+        if surah_number not in SHORT_SURAHS:
             continue
 
         try:
-            info = commons_file_info(title)
+
+            info = get_wikimedia_file_info(
+                title
+            )
 
         except Exception as error:
+
             print(
-                "Skipping Wikimedia file:",
+                "Could not inspect:",
                 title,
                 error
             )
+
             continue
 
         if not info:
             continue
 
-        license_text = info["license"].lower()
+        license_text = (
+            info["license"].lower()
+        )
 
         if (
             "cc0" not in license_text
             and
-            "public domain" not in license_text
+            "public domain"
+            not in license_text
         ):
             continue
 
-        candidates.append(
-            {
-                "surah": number,
-                "name": SHORT_SURAHS[number],
+        if surah_number not in found:
+
+            found[surah_number] = {
+                "surah": surah_number,
+                "name": SHORT_SURAHS[
+                    surah_number
+                ],
                 "title": title,
                 "url": info["url"],
                 "license": info["license"],
             }
-        )
 
-    unique = {}
-
-    for item in candidates:
-
-        if item["surah"] not in unique:
-            unique[item["surah"]] = item
-
-    result = list(unique.values())
+    result = list(
+        found.values()
+    )
 
     print(
         "Found",
         len(result),
-        "usable CC0/public-domain short-surah recordings."
+        "usable CC0/public-domain recordings."
     )
 
     if len(result) < 2:
+
         raise RuntimeError(
-            "Fewer than 2 usable CC0/public-domain "
-            "short-surah recordings were found."
+            "Not enough CC0/public-domain "
+            "Quran recordings found."
         )
 
     return result
@@ -390,25 +423,27 @@ def discover_cc0_recitations():
 # PEXELS
 # ============================================================
 
-def pexels_search(query):
+def search_pexels(query):
 
     if not PEXELS_API_KEY:
+
         raise RuntimeError(
-            "PEXELS_API_KEY GitHub secret is missing."
+            "PEXELS_API_KEY is missing."
         )
 
     response = requests.get(
         "https://api.pexels.com/v1/videos/search",
         headers={
-            "Authorization": PEXELS_API_KEY
+            "Authorization":
+                PEXELS_API_KEY
         },
         params={
             "query": query,
             "orientation": "portrait",
-            "size": "medium",
-            "per_page": 15,
+            "size": "large",
+            "per_page": 20,
         },
-        timeout=30,
+        timeout=30
     )
 
     response.raise_for_status()
@@ -421,96 +456,95 @@ def pexels_search(query):
 
 def choose_pexels_video(query):
 
-    videos = pexels_search(query)
+    videos = search_pexels(
+        query
+    )
 
     if not videos:
+
         raise RuntimeError(
-            f"No Pexels portrait videos found for: {query}"
+            "No Pexels videos found for: "
+            + query
         )
 
-    ranked = []
+    possible = []
 
     for video in videos:
 
         duration = float(
-            video.get("duration") or 0
+            video.get(
+                "duration",
+                0
+            )
         )
 
-        files = video.get(
-            "video_files"
-        ) or []
+        for video_file in (
+            video.get(
+                "video_files",
+                []
+            )
+        ):
 
-        portrait_files = []
+            width = (
+                video_file.get(
+                    "width"
+                )
+                or 0
+            )
 
-        for video_file in files:
+            height = (
+                video_file.get(
+                    "height"
+                )
+                or 0
+            )
 
-            width = video_file.get(
-                "width"
-            ) or 0
+            link = video_file.get(
+                "link"
+            )
 
-            height = video_file.get(
-                "height"
-            ) or 0
+            if not link:
+                continue
 
-            if (
-                height >= width
-                and
-                height >= 1280
-                and
-                video_file.get("link")
-            ):
-                portrait_files.append(
+            if height < width:
+                continue
+
+            if height < 1280:
+                continue
+
+            quality_difference = abs(
+                width - 1080
+            )
+
+            possible.append(
+                (
+                    0 if duration >= 15 else 10,
+                    quality_difference,
+                    video,
                     video_file
                 )
-
-        if not portrait_files:
-            continue
-
-        portrait_files.sort(
-            key=lambda item: (
-                abs(
-                    (item.get("width") or 0)
-                    - 1080
-                ),
-                -(
-                    item.get("height")
-                    or 0
-                ),
             )
-        )
 
-        chosen = portrait_files[0]
+    if not possible:
 
-        score = (
-            0 if duration >= 15 else 10,
-            abs(
-                (chosen.get("width") or 0)
-                - 1080
-            ),
-        )
-
-        ranked.append(
-            (
-                score,
-                video,
-                chosen
-            )
-        )
-
-    if not ranked:
         raise RuntimeError(
-            f"No suitable portrait Pexels video found "
-            f"for: {query}"
+            "No suitable portrait Pexels "
+            "video was found."
         )
 
-    ranked.sort(
-        key=lambda item: item[0]
+    possible.sort(
+        key=lambda x: (
+            x[0],
+            x[1]
+        )
     )
 
-    _, video, chosen = ranked[0]
+    _, _, video, video_file = possible[0]
 
     return {
-        "video_id": video.get("id"),
+        "video_id": video.get(
+            "id"
+        ),
         "page_url": video.get(
             "url",
             "https://www.pexels.com/"
@@ -522,251 +556,291 @@ def choose_pexels_video(query):
             "name",
             "Pexels contributor"
         ),
-        "download_url": chosen["link"],
+        "download_url":
+            video_file["link"]
     }
 
 
 # ============================================================
-# ARABIC OVERLAY
+# ARABIC TEXT OVERLAY
 # ============================================================
 
-current_surah_name = ""
+def arabic_words(text):
+
+    text = re.sub(
+        r"[ۖۗۚۛۙۜۢ۝﴾﴿]",
+        " ",
+        text
+    )
+
+    text = text.replace(
+        "(",
+        " "
+    )
+
+    text = text.replace(
+        ")",
+        " "
+    )
+
+    return [
+        word
+        for word in clean_text(
+            text
+        ).split()
+        if word
+    ]
 
 
-def render_overlay(
-    text,
+def make_groups(words):
+
+    return [
+        words[i:i + 4]
+        for i in range(
+            0,
+            len(words),
+            4
+        )
+    ]
+
+
+def create_overlay(
+    arabic,
     surah_name,
     verse_number,
-    path
+    output_file
 ):
 
     image = Image.new(
         "RGBA",
-        (W, H),
-        (0, 0, 0, 0)
+        (
+            WIDTH,
+            HEIGHT
+        ),
+        (
+            0,
+            0,
+            0,
+            0
+        )
     )
 
-    draw = ImageDraw.Draw(image)
+    draw = ImageDraw.Draw(
+        image
+    )
 
     font = ImageFont.truetype(
         str(FONT),
         74
     )
 
-    ref_font = ImageFont.truetype(
-        str(FONT),
-        34
-    )
-
-    bbox = draw.textbbox(
-        (0, 0),
-        text,
-        font=font,
-        direction="rtl",
-        language="ar",
-        stroke_width=0,
-    )
-
-    text_width = (
-        bbox[2] - bbox[0]
-    )
-
-    x = (
-        W // 2
-        + text_width // 2
-    )
-
-    y = int(
-        H * 0.62
-    )
-
-    # Subtle shadow
-    for dx, dy, alpha in [
-        (3, 3, 140),
-        (-2, 2, 90),
-        (2, -2, 70),
-    ]:
-
-        draw.text(
-            (x + dx, y + dy),
-            text,
-            font=font,
-            fill=(0, 0, 0, alpha),
-            anchor="mm",
-            direction="rtl",
-            language="ar",
+    reference_font = (
+        ImageFont.truetype(
+            str(FONT),
+            32
         )
+    )
 
-    # White Arabic
+    # Arabic text
     draw.text(
-        (x, y),
-        text,
+        (
+            WIDTH // 2,
+            int(
+                HEIGHT * 0.62
+            )
+        ),
+        arabic,
         font=font,
-        fill=(255, 255, 255, 255),
+        fill=(
+            255,
+            255,
+            255,
+            255
+        ),
         anchor="mm",
         direction="rtl",
         language="ar",
+        stroke_width=0
     )
 
+    # Small reference
     reference = (
         f"{surah_name} • {verse_number}"
     )
 
-    ref_bbox = draw.textbbox(
-        (0, 0),
-        reference,
-        font=ref_font
-    )
-
-    ref_width = (
-        ref_bbox[2]
-        - ref_bbox[0]
-    )
-
     draw.text(
         (
-            (W + ref_width) // 2,
-            int(H * 0.70)
+            WIDTH // 2,
+            int(
+                HEIGHT * 0.70
+            )
         ),
         reference,
-        font=ref_font,
-        fill=(235, 235, 235, 235),
-        anchor="mm",
+        font=reference_font,
+        fill=(
+            235,
+            235,
+            235,
+            235
+        ),
+        anchor="mm"
     )
 
-    image.save(path)
+    image.save(
+        output_file
+    )
 
 
-def build_overlays(
+def create_overlays(
     ayahs,
-    total_duration,
-    workdir
+    duration,
+    workdir,
+    surah_name
 ):
 
-    overlays = []
-
-    all_groups = []
+    groups = []
 
     for ayah in ayahs:
 
-        words = split_arabic_words(
+        words = arabic_words(
             ayah["text"]
         )
 
-        groups = group_words(
-            words,
-            4
-        )
+        for group in make_groups(
+            words
+        ):
 
-        all_groups.append(
-            (
-                ayah["number"],
-                groups
+            groups.append(
+                (
+                    ayah["number"],
+                    group
+                )
             )
-        )
 
-    total_groups = sum(
-        len(groups)
-        for _, groups in all_groups
-    )
+    if not groups:
 
-    if total_groups == 0:
         raise RuntimeError(
             "No Arabic words found."
         )
 
-    group_duration = (
-        total_duration
-        / total_groups
+    time_per_group = (
+        duration
+        / len(groups)
     )
 
-    current_time = 0.0
+    overlays = []
 
-    for verse_number, groups in all_groups:
+    current_time = 0
 
-        for group in groups:
+    for index, (
+        verse_number,
+        words
+    ) in enumerate(groups):
 
-            overlay = (
-                workdir
-                / f"overlay_{len(overlays):03d}.png"
-            )
+        overlay_file = (
+            workdir
+            / f"overlay_{index:03d}.png"
+        )
 
-            render_overlay(
-                " ".join(group),
-                current_surah_name,
-                verse_number,
-                overlay,
-            )
+        create_overlay(
+            " ".join(words),
+            surah_name,
+            verse_number,
+            overlay_file
+        )
 
-            overlays.append(
-                {
-                    "path": overlay,
-                    "start": current_time,
-                    "duration": group_duration,
-                }
-            )
+        overlays.append(
+            {
+                "file":
+                    overlay_file,
+                "start":
+                    current_time,
+                "end":
+                    current_time
+                    + time_per_group
+            }
+        )
 
-            current_time += group_duration
+        current_time += (
+            time_per_group
+        )
 
     return overlays
 
 
 # ============================================================
-# CREATE VIDEO
+# VIDEO CREATION
 # ============================================================
 
 def create_video(
-    surah,
-    recitation_path,
-    nature_path,
-    output_path
+    recitation,
+    recitation_file,
+    nature_file,
+    output_file
 ):
 
-    global current_surah_name
+    surah_number = (
+        recitation["surah"]
+    )
 
-    current_surah_name = surah["name"]
+    surah_name = (
+        recitation["name"]
+    )
 
-    duration = ffprobe_duration(
-        recitation_path
+    duration = get_duration(
+        recitation_file
     )
 
     workdir = (
         OUTPUT
-        / f"work_{surah['surah']}"
+        / f"work_{surah_number}"
     )
 
     if workdir.exists():
-        shutil.rmtree(workdir)
+        shutil.rmtree(
+            workdir
+        )
 
     workdir.mkdir(
-        parents=True,
-        exist_ok=True
+        parents=True
+    )
+
+    print(
+        "Getting Quran text..."
     )
 
     ayahs = get_surah_text(
-        surah["surah"]
+        surah_number
     )
 
-    overlays = build_overlays(
+    print(
+        "Creating Arabic overlays..."
+    )
+
+    overlays = create_overlays(
         ayahs,
         duration,
-        workdir
+        workdir,
+        surah_name
     )
 
-    base = (
+    base_video = (
         workdir
         / "base.mp4"
     )
 
-    # Convert Pexels video to 1080x1920.
-    run(
+    print(
+        "Preparing nature video..."
+    )
+
+    run_command(
         [
             "ffmpeg",
             "-y",
             "-stream_loop",
             "-1",
             "-i",
-            str(nature_path),
+            str(nature_file),
             "-t",
             f"{duration:.3f}",
             "-vf",
@@ -787,90 +861,99 @@ def create_video(
             "23",
             "-pix_fmt",
             "yuv420p",
-            str(base),
+            str(base_video)
         ]
     )
 
-    cmd = [
+    command = [
         "ffmpeg",
         "-y",
         "-i",
-        str(base),
+        str(base_video),
         "-i",
-        str(recitation_path),
+        str(recitation_file)
     ]
 
-    for item in overlays:
+    for overlay in overlays:
 
-        cmd += [
-            "-loop",
-            "1",
-            "-i",
-            str(item["path"]),
-        ]
+        command.extend(
+            [
+                "-loop",
+                "1",
+                "-i",
+                str(
+                    overlay["file"]
+                )
+            ]
+        )
 
     filter_parts = []
 
-    last = "[0:v]"
+    previous = "[0:v]"
 
-    for index, item in enumerate(overlays):
+    for index, overlay in enumerate(
+        overlays
+    ):
 
         input_label = (
             f"[{index + 2}:v]"
         )
 
         output_label = (
-            f"[ov{index}]"
-        )
-
-        start = item["start"]
-
-        end = (
-            item["start"]
-            + item["duration"]
+            f"[v{index}]"
         )
 
         filter_parts.append(
-            f"{last}{input_label}"
+            f"{previous}"
+            f"{input_label}"
             f"overlay=0:0:"
             f"enable='between(t,"
-            f"{start:.3f},{end:.3f})'"
+            f"{overlay['start']:.3f},"
+            f"{overlay['end']:.3f})'"
             f"{output_label}"
         )
 
-        last = output_label
+        previous = output_label
 
     filter_complex = ";".join(
         filter_parts
     )
 
-    cmd += [
-        "-filter_complex",
-        filter_complex,
-        "-map",
-        last,
-        "-map",
-        "1:a:0",
-        "-t",
-        f"{duration:.3f}",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "23",
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        "-movflags",
-        "+faststart",
-        str(output_path),
-    ]
+    command.extend(
+        [
+            "-filter_complex",
+            filter_complex,
+            "-map",
+            previous,
+            "-map",
+            "1:a:0",
+            "-t",
+            f"{duration:.3f}",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-movflags",
+            "+faststart",
+            str(output_file)
+        ]
+    )
 
-    run(cmd)
+    print(
+        "Rendering final TikTok video..."
+    )
+
+    run_command(
+        command
+    )
 
     shutil.rmtree(
         workdir,
@@ -882,46 +965,54 @@ def create_video(
 # METADATA
 # ============================================================
 
-def write_metadata(
-    index,
-    surah,
+def create_metadata(
     recitation,
-    pexels_info
+    pexels
 ):
 
-    text = f"""TikTok Quran Short {index}
+    metadata = f"""TITLE
+{recitation['name']} — Surah {recitation['surah']} | Quran Recitation
 
-Title:
-{surah['name']} — Surah {surah['surah']} | Quran Recitation
+CAPTION
+Listen to the Qur'an — Surah {recitation['name']}. 🤍
 
-Caption:
-Listen to the Qur'an — Surah {surah['name']}. 🤍
-#Quran #QuranRecitation #Islam #Muslim #Allah #QuranShorts #TikTokIslam
+#Quran #QuranRecitation #Islam #Muslim #Allah #QuranTok #TikTokIslam
 
-Recitation:
+QURAN RECITATION
 CC0/public-domain recording from Wikimedia Commons.
-File: {recitation['title']}
-License: {recitation['license']}
-Source: {recitation['url']}
 
-Nature video:
-Pexels video ID: {pexels_info['video_id']}
-Photographer: {pexels_info['photographer']}
-Pexels page: {pexels_info['page_url']}
+File:
+{recitation['title']}
 
-Arabic text:
-Qur'an text from Al Quran Cloud / Tanzil.
+License:
+{recitation['license']}
 
-Timing:
-Arabic words are displayed in groups of approximately 4 words.
+Source:
+{recitation['url']}
+
+NATURE VIDEO
+Pexels video ID:
+{pexels['video_id']}
+
+Photographer:
+{pexels['photographer']}
+
+Pexels page:
+{pexels['page_url']}
+
+ARABIC TEXT
+Quran text obtained through Al Quran Cloud using Uthmani text.
+
+TIMING
+Arabic text is displayed approximately 4 words at a time.
 Timing is proportional to the complete recitation.
 """
 
     (
         OUTPUT
-        / f"metadata_{index}.txt"
+        / "metadata_1.txt"
     ).write_text(
-        text,
+        metadata,
         encoding="utf-8"
     )
 
@@ -932,141 +1023,177 @@ Timing is proportional to the complete recitation.
 
 def main():
 
+    print(
+        "=========================================="
+    )
+
+    print(
+        "FREE TIKTOK QURAN VIDEO GENERATOR"
+    )
+
+    print(
+        "=========================================="
+    )
+
     if not FONT.exists():
+
         raise RuntimeError(
-            f"Missing font: {FONT}"
+            "NotoNaskhArabic-Regular.otf "
+            "was not found in fonts/"
         )
 
     if not PEXELS_API_KEY:
+
         raise RuntimeError(
-            "PEXELS_API_KEY is missing."
+            "PEXELS_API_KEY GitHub Secret "
+            "is missing."
         )
 
-    ensure_dirs()
+    prepare_output()
 
-    print(
-        "Discovering CC0/public-domain "
-        "Quran recitations..."
-    )
-
+    # Find available CC0 recordings.
     recordings = (
-        discover_cc0_recitations()
+        find_cc0_recitations()
     )
 
     if not recordings:
+
         raise RuntimeError(
-            "No usable CC0/public-domain "
-            "Quran recordings were found."
+            "No usable CC0 recordings found."
         )
 
-    required = {
-        "surah",
-        "name",
-        "title",
-        "url",
-        "license",
-    }
-
-    missing = (
-        required
-        - set(recordings[0].keys())
+    random.shuffle(
+        recordings
     )
-
-    if missing:
-        raise RuntimeError(
-            "Invalid recitation data. "
-            f"Missing fields: {sorted(missing)}"
-        )
-
-    random.shuffle(recordings)
 
     recitation = recordings[0]
 
     print(
-        f"\n=== Today's video: "
-        f"Surah {recitation['surah']} "
-        f"{recitation['name']} ==="
-    )
-
-    index = 1
-
-    rec_path = (
-        OUTPUT
-        / "recitation_1.mp3"
-    )
-
-    nature_path = (
-        OUTPUT
-        / "nature_1.mp4"
-    )
-
-    output_path = (
-        OUTPUT
-        / "tiktok_quran_1.mp4"
+        "\nSelected Surah:",
+        recitation["name"]
     )
 
     print(
-        "Downloading CC0 recitation..."
+        "Surah number:",
+        recitation["surah"]
     )
 
-    download(
-        recitation["url"],
-        rec_path
+    # --------------------------------------------------------
+    # Download Quran recitation
+    # --------------------------------------------------------
+
+    recitation_file = (
+        OUTPUT
+        / "recitation.mp3"
     )
+
+    print(
+        "\nDownloading Quran recitation..."
+    )
+
+    download_file(
+        recitation["url"],
+        recitation_file,
+        headers=WIKIMEDIA_HEADERS
+    )
+
+    print(
+        "Recitation downloaded."
+    )
+
+    # --------------------------------------------------------
+    # Get nature video
+    # --------------------------------------------------------
 
     query = random.choice(
         NATURE_QUERIES
     )
 
     print(
-        "Searching Pexels:",
+        "\nPexels search:",
         query
     )
 
-    pexels_info = (
-        choose_pexels_video(query)
+    pexels = choose_pexels_video(
+        query
+    )
+
+    nature_file = (
+        OUTPUT
+        / "nature.mp4"
     )
 
     print(
-        "Downloading Pexels nature video..."
+        "Downloading Pexels video..."
     )
 
-    download(
-        pexels_info["download_url"],
-        nature_path
+    download_file(
+        pexels["download_url"],
+        nature_file
     )
 
     print(
-        "Creating final video..."
+        "Nature video downloaded."
+    )
+
+    # --------------------------------------------------------
+    # Create final video
+    # --------------------------------------------------------
+
+    output_file = (
+        OUTPUT
+        / "tiktok_quran_1.mp4"
     )
 
     create_video(
         recitation,
-        recitation,
-        rec_path,
-        output_path,
+        recitation_file,
+        nature_file,
+        output_file
     )
 
-    write_metadata(
-        index,
+    # --------------------------------------------------------
+    # Metadata
+    # --------------------------------------------------------
+
+    create_metadata(
         recitation,
-        recitation,
-        pexels_info
+        pexels
     )
 
-    rec_path.unlink(
+    recitation_file.unlink(
         missing_ok=True
     )
 
-    nature_path.unlink(
+    nature_file.unlink(
         missing_ok=True
     )
-
-    print("\nDONE")
 
     print(
-        output_path,
-        f"{output_path.stat().st_size / 1024 / 1024:.1f} MB"
+        "\n=========================================="
+    )
+
+    print(
+        "VIDEO CREATED SUCCESSFULLY"
+    )
+
+    print(
+        "=========================================="
+    )
+
+    print(
+        output_file
+    )
+
+    print(
+        "Size:",
+        round(
+            output_file.stat().st_size
+            / 1024
+            / 1024,
+            2
+        ),
+        "MB"
     )
 
 
